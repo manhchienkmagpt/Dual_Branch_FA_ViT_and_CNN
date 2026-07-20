@@ -1,0 +1,50 @@
+data_root: "D:/chien_duy_thinh_ct7/gan_make_worse/data_training/ffpp_faces_scrfd"
+train_dir: "train"
+val_dir: "val"
+test_dir: "test"
+cross_dataset_root: "D:/chien_duy_thinh_ct7/gan_make_worse/data_training/celebdf_faces_scrfd/test"
+gan_fake_dir: "F:/DeepFakedata/chien_duy_thinh_output/gan_data/generated_fake_2"
+gan_real_dir: "F:/DeepFakedata/chien_duy_thinh_output/gan_data/generated_real"
+
+# Separate stage-two outputs
+stage_2_save_dir: "checkpoints_stage_2"
+stage_2_checkpoint_name: "best_stage_2.pth"
+cross_stage_2_save_dir: "checkpoints_cross_stage_2"
+cross_stage_2_checkpoint_name: "best_cross_stage_2.pth"
+
+image_size: 224
+batch_size: 16
+num_workers: 4
+epochs: 30
+lr: 1e-4
+weight_decay: 1e-4
+dropout: 0.4
+pretrained: true
+backbone: "redesigned_favit"  # also supports: frequency_aware_favit
+freq_in_channels: 3
+freq_dim: 128
+use_freq: true
+original_upsample_factor: null
+train_real_percent: 100  # use 0-100% of original images in train_dir/original
+save_dir: "checkpoints_redesigned_favit"
+checkpoint_name: "best_redesigned_favit.pth"
+gan_save_dir: "checkpoints_redesigned_favit"
+gan_checkpoint_name: "best_redesigned_favit_gan.pth"
+resume_from: null
+seed: 42
+threshold: 0.5
+device: "cuda"
+
+early_stopping_patience: 5
+lr_scheduler_patience: 2
+lr_scheduler_factor: 0.5
+min_lr: 1e-7
+
+use_pos_weight: true   # weight loss by num_real/num_fake to reduce fake-prediction bias
+pos_weight: 0.0       # null = auto num_real/num_fake; set a positive number for a manual value
+label_smoothing: 0.1 # soft targets: prevents overconfidence on FF++-specific features
+lambda_fal: 0.0        # set > 0 to add FALoss for redesigned_favit/favit_cnn
+fal_margin: 0.25
+fal_scale: 32
+fal_momentum: 0.99     # EMA prototype momentum for frequency_aware_favit
+aux_weight: 0.3        # deep-supervision weight for frequency_aware_favit
