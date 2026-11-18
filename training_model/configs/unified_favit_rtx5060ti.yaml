@@ -1,0 +1,54 @@
+# Ready-to-run configuration for Unified FA-ViT-CNN on RTX 5060 Ti 16GB VRAM
+data_root: "E:/Deepfake_Data_Chien/ffpp_celebdf_data/processed/faces/ffpp/c23"
+train_dir: "train"
+val_dir: "val"
+test_dir: "test"
+cross_dataset_root: "E:/Deepfake_Data_Chien/ffpp_celebdf_data/processed/faces/celebdf/test"
+
+image_size: 224
+batch_size: 16
+grad_accum_steps: 2       # Effective batch size = 32 on 16GB VRAM
+num_workers: 4
+epochs: 30
+lr: 1e-4
+weight_decay: 1e-4
+dropout: 0.3
+pretrained: true
+
+# Upgraded Unified FA-ViT-CNN (A + B + C)
+backbone: "favit_cnn"
+vit_backbone_name: "vit_base_patch16_clip_224"  # or "vit_base_patch14_dinov2"
+tune_vit_layernorm: true
+freq_in_channels: 3
+freq_dim: 128
+use_freq: true
+use_learnable_fft: true
+use_bidirectional_fusion: true
+use_aux_head: true
+
+# Mixed precision for RTX 5060 Ti
+use_amp: true
+amp_dtype: "bfloat16"
+
+# Losses for Generalization & Spectral Debiasing
+use_pos_weight: true
+pos_weight: null          # auto num_real / num_fake
+label_smoothing: 0.1
+lambda_fal: 0.2           # Hyperspherical FA Loss
+fal_margin: 0.25
+fal_scale: 32
+lambda_freq_cons: 0.5     # Spectral-Consistency Debiasing Loss
+aux_weight: 0.3           # Patch Anomaly Aux Head weight
+
+save_dir: "checkpoints_unified_favit"
+checkpoint_name: "best_unified_favit.pth"
+selection_metric: "video_auc"  # use "auc" for frame-level val_auc
+resume_from: null
+seed: 42
+threshold: 0.5
+device: "cuda"
+
+early_stopping_patience: 6
+lr_scheduler_patience: 2
+lr_scheduler_factor: 0.5
+min_lr: 1e-7

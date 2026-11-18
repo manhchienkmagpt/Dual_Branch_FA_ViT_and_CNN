@@ -1,7 +1,7 @@
 import inspect
 import random
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import albumentations as A
 import cv2
@@ -45,7 +45,12 @@ LEGACY_DATASET_LABELS: Dict[str, int] = {
     "fake": 1,
 }
 
-CROSS_DATASET_LABELS: Dict[str, int] = {**ORIGIN_DATASET_LABELS, **LEGACY_DATASET_LABELS}
+CROSS_DATASET_LABELS: Dict[str, int] = {
+    **ORIGIN_DATASET_LABELS,
+    **LEGACY_DATASET_LABELS,
+    "0": 0,
+    "1": 1,
+}
 
 
 def _gauss_noise():
@@ -62,7 +67,30 @@ def _image_compression():
     return A.ImageCompression(quality_lower=30, quality_upper=90, p=0.5)
 
 
-def get_train_transform(image_size: int = 380) -> A.Compose:
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
+CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+
+
+def get_normalization_stats(
+    backbone: str = "favit_cnn",
+    vit_backbone_name: str = "vit_base_patch16_clip_224",
+) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
+    b_norm = backbone.strip().lower().replace("-", "_")
+    if b_norm in {"favit_cnn", "unified_favit"} and "clip" in vit_backbone_name.lower():
+        return CLIP_MEAN, CLIP_STD
+    if b_norm in {"redesigned_favit", "favit"}:
+        # RedesignedFAViT uses timm's vit_base_patch16_224 pretrained backbone.
+        return (0.5, 0.5, 0.5), (0.5, 0.5, 0.5)
+    return IMAGENET_MEAN, IMAGENET_STD
+
+
+def get_train_transform(
+    image_size: int = 380,
+    mean: Tuple[float, float, float] = IMAGENET_MEAN,
+    std: Tuple[float, float, float] = IMAGENET_STD,
+) -> A.Compose:
     return A.Compose(
         [
             A.Resize(image_size, image_size),
@@ -97,17 +125,21 @@ def get_train_transform(image_size: int = 380) -> A.Compose:
             _gauss_noise(),
             A.GaussianBlur(blur_limit=(3, 5), p=0.3),
             _image_compression(),
-            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            A.Normalize(mean=mean, std=std),
             ToTensorV2(),
         ]
     )
 
 
-def get_eval_transform(image_size: int = 380) -> A.Compose:
+def get_eval_transform(
+    image_size: int = 380,
+    mean: Tuple[float, float, float] = IMAGENET_MEAN,
+    std: Tuple[float, float, float] = IMAGENET_STD,
+) -> A.Compose:
     return A.Compose(
         [
             A.Resize(image_size, image_size),
-            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            A.Normalize(mean=mean, std=std),
             ToTensorV2(),
         ]
     )
@@ -127,6 +159,7 @@ class DeepfakeFrameDataset(Dataset):
         train_real_percent: Optional[Union[float, int, str]] = 100,
         seed: int = 42,
         mode: Optional[str] = None,
+        exclude_classes: Optional[Sequence[str]] = None,
     ) -> None:
         self.root_dir = Path(root_dir)
         self.split = split
@@ -137,6 +170,7 @@ class DeepfakeFrameDataset(Dataset):
         self.original_upsample_factor = self._normalize_upsample_factor(original_upsample_factor)
         self.train_real_percent = self._normalize_percent(train_real_percent)
         self.seed = int(seed)
+        self.exclude_classes = {c.strip().lower() for c in (exclude_classes or []) if c}
 
         self.split_dir = self._resolve_split_dir()
         self.class_to_label = self._get_class_mapping()
@@ -196,13 +230,32 @@ class DeepfakeFrameDataset(Dataset):
     def _collect_samples(self) -> List[Tuple[Path, float, bool]]:
         samples: List[Tuple[Path, float, bool]] = []
         original_samples: List[Tuple[Path, float, bool]] = []
+        seen_paths = set()
+
+        fake_root = find_class_dir(self.split_dir, "fake")
+        has_nested_fake_methods = fake_root.exists() and any(
+            find_class_dir(fake_root, m).exists()
+            for m in ("deepfakes", "face2face", "faceshifter", "faceswap", "neuraltextures")
+        )
 
         for class_name, label in self.class_to_label.items():
+            if class_name.lower() in self.exclude_classes:
+                continue
+            if class_name.lower() == "fake" and has_nested_fake_methods:
+                continue
+
             class_dir = self._find_class_dir(class_name)
+            if not class_dir.exists() and has_nested_fake_methods and label == 1:
+                class_dir = find_class_dir(fake_root, class_name)
             if not class_dir.exists():
                 continue
 
-            class_samples = [(path, float(label), False) for path in self._collect_class_images(class_dir)]
+            class_samples = [
+                (path, float(label), False)
+                for path in self._collect_class_images(class_dir)
+                if path not in seen_paths
+            ]
+            seen_paths.update(path for path, _, _ in class_samples)
             if label == 0:
                 class_samples = self._select_train_real_samples(class_samples)
                 original_samples.extend(class_samples)

@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "colab-chrome": {
+      "command": "C:\\Windows\\System32\\cmd.exe",
+      "args": ["/d", "/c", "npx.cmd", "--yes", "chrome-devtools-mcp@1.13.0", "--autoConnect", "--workspace=D:\\ICCIES\\Dual_Branch_FA_ViT_and_CNN", "--no-usage-statistics", "--no-performance-crux"],
+      "timeoutSeconds": 90,
+      "tools": {"list_pages": {"eager": true}, "take_snapshot": {"eager": true}}
+    }
+  }
+}

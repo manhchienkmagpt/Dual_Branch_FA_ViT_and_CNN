@@ -200,7 +200,7 @@ Each output filename encodes the dataset, split, source or class, video identifi
 - `original` or `real`: **0**
 - `Deepfakes`, `Face2Face`, `FaceSwap`, `NeuralTextures`, `FaceShifter`, or `fake`: **1**
 
-Validation and test images are resized and normalized using ImageNet statistics. Training-time augmentation includes horizontal flipping, rotation, affine scaling and translation, brightness and contrast transformations, HSV and RGB transformations, gamma adjustment, Gaussian noise, blurring, and JPEG compression. The proportion of real training samples can be reduced with `train_real_percent`, or real samples can be replicated with additional augmentation through `original_upsample_factor`.
+Validation and test images are resized and normalized for the backbone: CLIP statistics for CLIP-based `favit_cnn`, mean/std `(0.5, 0.5, 0.5)` for `redesigned_favit`, and ImageNet statistics for the CNN/Swin baselines. Paper visualization uses the same statistics. Training-time augmentation includes horizontal flipping, rotation, affine scaling and translation, brightness and contrast transformations, HSV and RGB transformations, gamma adjustment, Gaussian noise, blurring, and JPEG compression. The proportion of real training samples can be reduced with `train_real_percent`, or real samples can be replicated with additional augmentation through `original_upsample_factor`.
 
 ## 3. FA-ViT-CNN Architecture
 
@@ -243,7 +243,7 @@ The FA-ViT CLS representation is concatenated with the auxiliary CNN representat
 LayerNorm -> Dropout(0.3) -> Linear -> 1 logit
 ```
 
-The `forward()` method returns `(logits, fused_features)`. The logits are not passed through a sigmoid within the model. During inference, the fake-class probability is computed as `sigmoid(logit)` and compared with `threshold`, whose default value is 0.5.
+For `favit_cnn`, `forward()` returns `(logits, normed_features, aux_logits)`. The returned features are taken after the classifier LayerNorm and before dropout, matching the feature space used by FALoss and the final Linear weight. The logits are not passed through a sigmoid within the model. During inference, the fake-class probability is computed as `sigmoid(logit)` and compared with `threshold`, whose default value is 0.5.
 
 ## 4. Model Training
 
@@ -288,7 +288,7 @@ Resume training from a checkpoint with:
 python train.py --config configs/config.yaml --resume /path/to/checkpoint.pth
 ```
 
-Training uses `BCEWithLogitsLoss`, the AdamW optimizer, optional label smoothing, a `ReduceLROnPlateau` learning-rate scheduler, and early stopping based on validation accuracy. The optional **Forgery-Aware Loss (FALoss)** can be enabled with:
+Training uses `BCEWithLogitsLoss`, the AdamW optimizer, optional label smoothing, a `ReduceLROnPlateau` learning-rate scheduler, and early stopping based on validation ROC-AUC. In `train.py`, set `selection_metric: "video_auc"` (default) for video-level validation AUC or `selection_metric: "auc"` for frame-level `val_auc`. The best checkpoint is selected by the same AUC metric. The optional **Forgery-Aware Loss (FALoss)** can be enabled with:
 
 ```yaml
 lambda_fal: 0.1

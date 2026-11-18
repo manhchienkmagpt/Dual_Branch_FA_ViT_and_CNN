@@ -28,6 +28,47 @@ deepfake_efficientnetb4/
 
 ## Install
 
+From the repository root on Windows, double-click `setup_and_run.bat` or run:
+
+```powershell
+.\setup_and_run.bat
+```
+
+The launcher requires 64-bit Python 3.10-3.14, an NVIDIA driver, and internet for
+initial package/pretrained-weight downloads. It creates `.venv-training`, installs
+PyTorch 2.11.0 + torchvision 0.26.0 CUDA 12.8 wheels and this project's requirements,
+checks imports/CUDA/data directories, then runs all experiment scenarios. The wheel
+pair follows the [official PyTorch installation commands](https://pytorch.org/get-started/previous-versions/#v2110).
+It reuses installed dependencies and experiment progress on subsequent launches.
+Installed package versions are recorded in `.venv-training/installed-packages.txt`.
+
+The default config is `configs/unified_favit_rtx5060ti.yaml`; edit its data paths
+and training settings for your machine. The launcher keeps these settings and
+checks video-folder counts; it does not audit split manifests or source identities.
+
+```powershell
+# Show the setup plan without installing packages or starting training:
+powershell -NoProfile -ExecutionPolicy Bypass -File .\setup_and_run.ps1 -Preview
+# Install/check the environment without requiring data or starting training:
+powershell -NoProfile -ExecutionPolicy Bypass -File .\setup_and_run.ps1 -SetupOnly
+# After setup, list all scenario states without checking data or running CUDA kernels:
+powershell -NoProfile -ExecutionPolicy Bypass -File .\setup_and_run.ps1 -DryRun
+# Use another Python executable/config:
+powershell -NoProfile -ExecutionPolicy Bypass -File .\setup_and_run.ps1 -PythonExe C:\Python312\python.exe -ConfigPath training_model\configs\unified_favit_rtx5060ti.yaml
+```
+
+Run the same launcher again to resume. Use `-Reinstall` if the isolated environment
+needs repair. Normal runs check all FF++ train/val/test real and fake method folders
+and Celeb-DF `test/0`, `test/1` before launching training.
+
+After each epoch, the console prints train/validation frame loss, accuracy,
+balanced accuracy, F1, precision, recall, ROC-AUC, EER, and AP. It also prints the
+selected validation AUC (`val_video_auc` by default), best AUC, current LR,
+epochs without improvement, whether the best checkpoint was saved, and whether
+LR was reduced. `last_best_model.pth` is saved after every completed epoch.
+Training loss includes enabled auxiliary losses; validation loss is BCE only.
+FF++ test and Celeb-DF test are evaluated after training each scenario completes.
+
 ```bash
 cd deepfake_efficientnetb4
 python -m venv .venv
@@ -133,18 +174,11 @@ Available values:
 - `swin_small`: Swin Transformer Small
 - `redesigned_favit`: frozen ViT-B/16 backbone with trainable GAM, LAM, CNN local branch, and classifier
 - `favit_cnn`: `redesigned_favit` style RGB branch plus a lightweight CNN feature extractor branch
-- `frequency_aware_favit`: ViT-B/16 with GAM, spatial CNN and fixed-SRM frequency branches,
-  partial fine-tuning, deep supervision, and EMA prototype FALoss
 
-To train the frequency-aware model, set:
-
-```yaml
-backbone: "frequency_aware_favit"
-lambda_fal: 0.1
-aux_weight: 0.3
-fal_momentum: 0.99
-```
-`redesigned_favit` and `favit_cnn` return raw logits plus features internally. Use `lambda_fal` to enable the optional forgery-aware loss:
+`redesigned_favit` and `favit_cnn` return raw logits plus features internally.
+`favit_cnn` returns classifier features after LayerNorm and before dropout so
+FALoss and the final Linear classifier operate in the same feature space.
+Use `lambda_fal` to enable the optional forgery-aware loss:
 
 ```yaml
 backbone: "favit_cnn"
@@ -166,7 +200,7 @@ python train.py --config configs/config.yaml --resume checkpoints/best_model.pth
 
 Or set `resume_from` in `configs/config.yaml`.
 
-The best checkpoint is saved by validation accuracy to:
+The best checkpoint is saved when validation ROC-AUC strictly improves, to:
 
 ```text
 save_dir/checkpoint_name
@@ -183,9 +217,32 @@ Training uses:
 
 - `BCEWithLogitsLoss`
 - `AdamW`
-- `ReduceLROnPlateau(mode="max")` tracking validation accuracy
-- Early stopping tracking validation accuracy
+- `ReduceLROnPlateau(mode="max")` tracking the selected validation AUC
+- Early stopping tracking the same validation AUC
 - Strong augmentation for all train samples, including real, fake, and upsampled real samples
+
+For `train.py` and its GAN/stage-two wrappers, choose the validation metric with:
+
+```yaml
+selection_metric: "video_auc"  # default; use "auc" for frame-level val_auc
+```
+
+Each video's frames must be directly inside its own video folder. Grouping uses
+the full parent directory path, including dataset, split, class, and method;
+frame filenames and numeric folder names such as `0` and `1` do not affect grouping.
+Video scores are mean frame probabilities within each folder. Accuracy remains a
+reported metric. Best and last checkpoints store the scheduler state after its
+epoch update so resuming keeps the same AUC schedule.
+
+Resuming with a different `selection_metric` raises an error. Keep the original
+metric or start a new run. Legacy checkpoints without metric metadata restore
+model/optimizer state but reset best AUC, scheduler history, and the early-stopping
+counter. Paper visualization uses the same normalization and matching RGB
+denormalization as evaluation: CLIP statistics for CLIP and mean/std `0.5` for
+the `redesigned_favit` backbone.
+
+The `ablation_1_vit_gam` scenario is CLIP ViT with trainable LayerNorm and GAM,
+without the CNN/frequency branch. It is not a plain ViT baseline.
 
 Set `original_upsample_factor: null` to disable upsampling. Set it to `N` to keep all real samples and add `N` extra augmented copies for each real training image.
 
@@ -235,8 +292,8 @@ This script:
 
 - trains on `data_root/train_dir`
 - evaluates on `cross_dataset_root` after every epoch
-- saves a checkpoint when cross-dataset accuracy improves
-- uses `ReduceLROnPlateau(mode="max")` and early stopping based on cross-dataset accuracy
+- saves a checkpoint when cross-dataset AUC improves
+- uses `ReduceLROnPlateau(mode="max")` and early stopping based on cross-dataset AUC
 
 ## WildDeepfake Stage-Two Training
 

@@ -1,0 +1,24 @@
+from utils import build_arg_parser, run_preprocess_celebdf_test
+
+
+def main() -> None:
+    parser = build_arg_parser("Preprocess CelebDF-v2 test videos with SCRFD face detection")
+    parser.add_argument(
+        "--test_list",
+        type=str,
+        default=None,
+        help="CelebDF test list txt. Defaults to input_root/List_of_testing_videos.txt",
+    )
+    args = parser.parse_args()
+
+    run_preprocess_celebdf_test(
+        input_root=args.input_root,
+        output_root=args.output_root,
+        scrfd_model=args.scrfd_model,
+        img_size=args.img_size,
+        test_list=args.test_list,
+    )
+
+
+if __name__ == "__main__":
+    main()

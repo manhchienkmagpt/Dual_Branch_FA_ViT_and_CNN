@@ -172,7 +172,6 @@ def run_training_loop(
             label_smoothing=label_smoothing,
             fa_criterion=fa_criterion,
             lambda_fal=lambda_fal,
-            aux_weight=float(config.get("aux_weight", 0.3)),
             max_steps=max_steps,
         )
         val_metrics = run_one_epoch(

@@ -5,23 +5,36 @@ from .backbones import (
     build_model,
     normalize_backbone_name,
 )
-from .favit_cnn import CNN_feature_extractor_branch, FALoss, FAViTCNN
-from .frequency_aware_favit import FrequencyAwareFAViT, PrototypeFALoss
+from .favit_cnn import (
+    BidirectionalGatedFusion,
+    CNN_feature_extractor_branch,
+    DualDomainFrequencyExtractor,
+    FALoss,
+    FAViTCNN,
+    LearnableRadialFFT,
+    SpectralConsistencyLoss,
+    UnifiedFAViT,
+    perturb_batch_for_debiasing,
+)
 from .redesigned_favit import CNNLocalExtractor, GAM, LAM, RedesignedFAViT
 
 __all__ = [
+    "BidirectionalGatedFusion",
     "CNNLocalExtractor",
+    "DualDomainFrequencyExtractor",
     "EfficientNetB4",
     "FALoss",
     "FAViTCNN",
-    "FrequencyAwareFAViT",
     "CNN_feature_extractor_branch",
     "GAM",
     "LAM",
+    "LearnableRadialFFT",
     "RedesignedFAViT",
-    "PrototypeFALoss",
+    "SpectralConsistencyLoss",
     "SwinTransformerSmall",
     "TimmBackbone",
+    "UnifiedFAViT",
     "build_model",
     "normalize_backbone_name",
+    "perturb_batch_for_debiasing",
 ]

@@ -2,7 +2,6 @@ import timm
 from torch import nn
 
 from .favit_cnn import FAViTCNN
-from .frequency_aware_favit import FrequencyAwareFAViT
 from .redesigned_favit import RedesignedFAViT
 
 
@@ -75,6 +74,8 @@ _BACKBONE_ALIASES = {
     "efficientnetb4": "efficientnetb4",
     "resnet50": "resnet50",
     "resnet_50": "resnet50",
+    "convnext_tiny": "convnext_tiny",
+    "convnext-tiny": "convnext_tiny",
     "swin_tiny": "swin_tiny",
     "swin-tiny": "swin_tiny",
     "swin_t": "swin_tiny",
@@ -88,13 +89,13 @@ _BACKBONE_ALIASES = {
     "favit": "redesigned_favit",
     "favit_cnn": "favit_cnn",
     "favit-cnn": "favit_cnn",
-    "frequency_aware_favit": "frequency_aware_favit",
-    "frequency-aware-favit": "frequency_aware_favit",
-    "fa_vit_v2": "frequency_aware_favit",
+    "unified_favit": "favit_cnn",
+    "unified-favit": "favit_cnn",
 }
 
 _TIMM_BACKBONES = {
     "resnet50": "resnet50",
+    "convnext_tiny": "convnext_tiny",
     "swin_tiny": "swin_tiny_patch4_window7_224",
 }
 
@@ -115,6 +116,12 @@ def build_model(
     freq_in_channels: int = 3,
     freq_dim: int = 128,
     use_freq: bool = True,
+    use_cnn_branch: bool = True,
+    vit_backbone_name: str = "vit_base_patch16_clip_224",
+    use_learnable_fft: bool = True,
+    use_bidirectional_fusion: bool = True,
+    use_aux_head: bool = True,
+    tune_vit_layernorm: bool = True,
 ) -> nn.Module:
     backbone_name = normalize_backbone_name(backbone)
     if backbone_name == "efficientnetb4":
@@ -127,15 +134,20 @@ def build_model(
         )
     if backbone_name == "redesigned_favit":
         return RedesignedFAViT(pretrained=pretrained, num_classes=1)
-    if backbone_name == "frequency_aware_favit":
-        return FrequencyAwareFAViT(pretrained=pretrained, num_classes=1)
     if backbone_name == "favit_cnn":
         return FAViTCNN(
+            backbone_name=vit_backbone_name,
             pretrained=pretrained,
             num_classes=1,
             freq_in_channels=freq_in_channels,
             freq_dim=freq_dim,
             use_freq=use_freq,
+            use_cnn_branch=use_cnn_branch,
+            use_learnable_fft=use_learnable_fft,
+            use_bidirectional_fusion=use_bidirectional_fusion,
+            use_aux_head=use_aux_head,
+            tune_vit_layernorm=tune_vit_layernorm,
+            dropout=dropout,
         )
     return TimmBackbone(
         model_name=_TIMM_BACKBONES[backbone_name],

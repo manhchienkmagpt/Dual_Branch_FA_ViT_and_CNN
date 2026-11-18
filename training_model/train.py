@@ -11,10 +11,20 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import ConcatDataset, DataLoader
 from tqdm import tqdm
 
-from datasets import DeepfakeFrameDataset, get_eval_transform, get_train_transform
-from models import FALoss, FrequencyAwareFAViT, PrototypeFALoss, build_model
+from datasets import (
+    DeepfakeFrameDataset,
+    get_eval_transform,
+    get_normalization_stats,
+    get_train_transform,
+)
+from models import (
+    FALoss,
+    SpectralConsistencyLoss,
+    build_model,
+    perturb_batch_for_debiasing,
+)
 from utils.checkpoint import load_checkpoint, save_checkpoint
-from utils.metrics import compute_binary_metrics, format_metrics
+from utils.metrics import aggregate_video_predictions, compute_binary_metrics, format_metrics
 from utils.seed import set_seed
 
 
@@ -142,9 +152,14 @@ def load_model_state_strict(
 
 def build_loaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
     image_size = int(config["image_size"])
-    train_transform = get_train_transform(image_size)
-    eval_transform = get_eval_transform(image_size)
+    mean, std = get_normalization_stats(
+        backbone=str(config.get("backbone", "favit_cnn")),
+        vit_backbone_name=str(config.get("vit_backbone_name", "vit_base_patch16_clip_224")),
+    )
+    train_transform = get_train_transform(image_size, mean=mean, std=std)
+    eval_transform = get_eval_transform(image_size, mean=mean, std=std)
 
+    exclude_manipulations = config.get("exclude_manipulations")
     train_dataset = DeepfakeFrameDataset(
         root_dir=config["data_root"],
         split=config["train_dir"],
@@ -155,6 +170,7 @@ def build_loaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
         train_real_percent=config.get("train_real_percent", 100),
         seed=int(config.get("seed", 42)),
         mode="train",
+        exclude_classes=exclude_manipulations,
     )
     val_dataset = DeepfakeFrameDataset(
         root_dir=config["data_root"],
@@ -164,6 +180,7 @@ def build_loaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
         eval_transform=eval_transform,
         original_upsample_factor=0,
         mode="val",
+        exclude_classes=exclude_manipulations,
     )
 
     train_loader = DataLoader(
@@ -195,7 +212,12 @@ def run_one_epoch(
     label_smoothing: float = 0.0,
     fa_criterion=None,
     lambda_fal: float = 0.0,
-    aux_weight: float = 0.3,
+    aux_weight: float = 0.0,
+    spectral_criterion=None,
+    lambda_freq_cons: float = 0.0,
+    use_amp: bool = False,
+    amp_dtype: torch.dtype = torch.bfloat16,
+    grad_accum_steps: int = 1,
     max_steps: Optional[int] = None,
 ):
     is_train = optimizer is not None
@@ -204,45 +226,75 @@ def run_one_epoch(
     processed_samples = 0
     labels_all = []
     probs_all = []
+    paths_all = []
+    amp_enabled = bool(use_amp and device.type == "cuda")
+    grad_accum_steps = max(1, int(grad_accum_steps))
+    total_steps = len(loader) if max_steps is None else min(len(loader), max_steps)
+
+    if is_train:
+        optimizer.zero_grad(set_to_none=True)
 
     progress = tqdm(loader, desc="Train" if is_train else "Val", leave=False)
-    for step, (images, labels, _) in enumerate(progress, start=1):
+    for step, (images, labels, paths) in enumerate(progress, start=1):
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        if is_train:
-            optimizer.zero_grad(set_to_none=True)
-
         with torch.set_grad_enabled(is_train):
-            logits, features, aux_logits = unpack_model_output(model(images))
-            logits_for_loss = logits.view_as(labels)
-            smooth_labels = labels * (1.0 - label_smoothing) + label_smoothing * 0.5 if is_train and label_smoothing > 0.0 else labels
-            loss = criterion(logits_for_loss, smooth_labels)
-            if is_train and aux_logits is not None and aux_weight > 0.0:
-                loss = loss + aux_weight * criterion(aux_logits.view_as(labels), smooth_labels)
-            if (
-                is_train
-                and fa_criterion is not None
-                and lambda_fal > 0.0
-                and features is not None
-            ):
-                if isinstance(fa_criterion, PrototypeFALoss):
-                    loss = loss + lambda_fal * fa_criterion(features, labels)
-                else:
+            with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                logits, features, aux_logits = unpack_model_output(model(images))
+                logits_for_loss = logits.view_as(labels)
+                smooth_labels = (
+                    labels * (1.0 - label_smoothing) + label_smoothing * 0.5
+                    if is_train and label_smoothing > 0.0
+                    else labels
+                )
+                loss = criterion(logits_for_loss, smooth_labels)
+
+                if is_train and aux_logits is not None and aux_weight > 0.0:
+                    loss = loss + aux_weight * criterion(aux_logits.view_as(labels), smooth_labels)
+
+                if (
+                    is_train
+                    and fa_criterion is not None
+                    and lambda_fal > 0.0
+                    and features is not None
+                ):
                     classifier_weight = get_classifier_weight(model)
                     if classifier_weight is not None:
                         loss = loss + lambda_fal * fa_criterion(features, labels, classifier_weight)
+
+                if (
+                    is_train
+                    and spectral_criterion is not None
+                    and lambda_freq_cons > 0.0
+                    and features is not None
+                ):
+                    perturbed_images = perturb_batch_for_debiasing(images)
+                    logits_pert, feat_pert, _ = unpack_model_output(model(perturbed_images))
+                    if feat_pert is not None:
+                        loss = loss + lambda_freq_cons * spectral_criterion(
+                            features, feat_pert, logits_for_loss, logits_pert.view_as(labels)
+                        )
+
             if is_train:
-                loss.backward()
-                optimizer.step()
+                window_start = ((step - 1) // grad_accum_steps) * grad_accum_steps
+                window_end = min(window_start + grad_accum_steps, total_steps)
+                window_size = max(1, window_end - window_start)
+                scaled_loss = loss / window_size
+                scaled_loss.backward()
+                if step % grad_accum_steps == 0 or step == total_steps:
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
 
         batch_size = images.size(0)
         total_loss += loss.item() * batch_size
         processed_samples += batch_size
-        probs = torch.sigmoid(logits.detach().view(-1))
+        probs = torch.sigmoid(logits.detach().float().view(-1))
 
         labels_all.extend(labels.detach().cpu().numpy().tolist())
         probs_all.extend(probs.cpu().numpy().tolist())
+        if not is_train:
+            paths_all.extend(paths)
         progress.set_postfix(loss=f"{loss.item():.4f}")
 
         if max_steps is not None and step >= max_steps:
@@ -251,20 +303,18 @@ def run_one_epoch(
     if processed_samples == 0:
         raise RuntimeError("The data loader did not yield any samples.")
     avg_loss = total_loss / processed_samples
-    return compute_binary_metrics(labels_all, probs_all, threshold=threshold, loss=avg_loss)
+    metrics = compute_binary_metrics(labels_all, probs_all, threshold=threshold, loss=avg_loss)
+    if not is_train and paths_all:
+        video_metrics, _, _, _ = aggregate_video_predictions(paths_all, labels_all, probs_all, threshold=threshold)
+        metrics["video_auc"] = video_metrics["auc"]
+        metrics["video_eer"] = video_metrics["eer"]
+    return metrics
 
 
 def create_fa_criterion(model, config: Dict, device: torch.device, lambda_fal: float):
-    """Build the loss variant matching the selected model's feature contract."""
+    """Build the optional forgery-aware loss for classifier features."""
     if lambda_fal <= 0.0:
         return None
-    if isinstance(model, FrequencyAwareFAViT):
-        return PrototypeFALoss(
-            dim=model.embed_dim,
-            margin=float(config.get("fal_margin", 0.25)),
-            scale=float(config.get("fal_scale", 32.0)),
-            momentum=float(config.get("fal_momentum", 0.99)),
-        ).to(device)
     return FALoss(
         margin=float(config.get("fal_margin", 0.25)),
         scale=float(config.get("fal_scale", 32.0)),
@@ -290,6 +340,22 @@ def run_training_loop(
         active_checkpoint = load_checkpoint(str(resume_path), device)
 
     threshold = float(config.get("threshold", 0.5))
+    selection_metric = str(config.get("selection_metric", "video_auc")).strip().lower()
+    if selection_metric not in {"auc", "video_auc"}:
+        raise ValueError("selection_metric must be 'auc' or 'video_auc'")
+    config = {**config, "selection_metric": selection_metric}
+    checkpoint_selection_metric = None
+    if active_checkpoint is not None:
+        checkpoint_selection_metric = (active_checkpoint.get("config") or {}).get("selection_metric")
+        if checkpoint_selection_metric is not None:
+            checkpoint_selection_metric = str(checkpoint_selection_metric).strip().lower()
+            if checkpoint_selection_metric != selection_metric:
+                raise ValueError(
+                    f"Cannot resume checkpoint '{resume_path}': selection_metric changed "
+                    f"from '{checkpoint_selection_metric}' to '{selection_metric}'. "
+                    "Keep the checkpoint's selection_metric or start a new run."
+                )
+    print(f"Checkpoint selection metric: val_{selection_metric}")
     backbone = str(config.get("backbone", "efficientnetb4"))
     print(f"Backbone: {backbone}")
     model = build_model(
@@ -300,6 +366,12 @@ def run_training_loop(
         freq_in_channels=int(config.get("freq_in_channels", 3)),
         freq_dim=int(config.get("freq_dim", 128)),
         use_freq=bool(config.get("use_freq", True)),
+        use_cnn_branch=bool(config.get("use_cnn_branch", True)),
+        vit_backbone_name=str(config.get("vit_backbone_name", "vit_base_patch16_clip_224")),
+        use_learnable_fft=bool(config.get("use_learnable_fft", True)),
+        use_bidirectional_fusion=bool(config.get("use_bidirectional_fusion", True)),
+        use_aux_head=bool(config.get("use_aux_head", True)),
+        tune_vit_layernorm=bool(config.get("tune_vit_layernorm", True)),
     ).to(device)
 
     if log_parameter_counts:
@@ -314,6 +386,13 @@ def run_training_loop(
     criterion = nn.BCEWithLogitsLoss(pos_weight=pw)
     lambda_fal = float(config.get("lambda_fal", 0.0))
     fa_criterion = create_fa_criterion(model, config, device, lambda_fal)
+    aux_weight = float(config.get("aux_weight", 0.3))
+    lambda_freq_cons = float(config.get("lambda_freq_cons", 0.0))
+    spectral_criterion = SpectralConsistencyLoss() if lambda_freq_cons > 0.0 else None
+    use_amp = bool(config.get("use_amp", True))
+    amp_dtype_name = str(config.get("amp_dtype", "bfloat16")).lower()
+    amp_dtype = torch.float16 if amp_dtype_name in {"fp16", "float16"} else torch.bfloat16
+    grad_accum_steps = int(config.get("grad_accum_steps", 1))
     optimizer = AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=float(config.get("lr", 1e-4)),
@@ -332,7 +411,7 @@ def run_training_loop(
 
     best_auc = -math.inf
     best_accuracy = -math.inf
-    epochs_without_accuracy_improvement = 0
+    epochs_without_auc_improvement = 0
     early_stopping_patience = int(config.get("early_stopping_patience", 5))
     total_epochs = int(config.get("epochs", 30))
     start_epoch = 1
@@ -342,14 +421,17 @@ def run_training_loop(
         load_model_state_strict(model, checkpoint, str(resume_path))
         if "optimizer_state_dict" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        if "scheduler_state_dict" in checkpoint:
-            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-
-        best_auc = float(checkpoint.get("best_auc", best_auc))
+        if checkpoint_selection_metric is not None:
+            if "scheduler_state_dict" in checkpoint:
+                scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            best_auc = float(checkpoint.get("best_auc", best_auc))
+            epochs_without_auc_improvement = int(checkpoint.get("epochs_without_improvement", 0))
+        else:
+            print(
+                "Checkpoint has no selection_metric metadata; restored model and optimizer, "
+                "but reset best AUC, early-stopping counter, and scheduler history."
+            )
         best_accuracy = float(checkpoint.get("best_accuracy", best_accuracy))
-        epochs_without_accuracy_improvement = int(
-            checkpoint.get("epochs_without_improvement", 0)
-        )
         checkpoint_epoch = int(checkpoint.get("epoch", 0))
         start_epoch = checkpoint_epoch + 1
         print(f"Resumed from checkpoint: {resume_path} (epoch {checkpoint_epoch})")
@@ -373,7 +455,12 @@ def run_training_loop(
             label_smoothing=label_smoothing,
             fa_criterion=fa_criterion,
             lambda_fal=lambda_fal,
-            aux_weight=float(config.get("aux_weight", 0.3)),
+            aux_weight=aux_weight,
+            spectral_criterion=spectral_criterion,
+            lambda_freq_cons=lambda_freq_cons,
+            use_amp=use_amp,
+            amp_dtype=amp_dtype,
+            grad_accum_steps=grad_accum_steps,
             max_steps=max_steps,
         )
         val_metrics = run_one_epoch(
@@ -383,10 +470,12 @@ def run_training_loop(
             device=device,
             optimizer=None,
             threshold=threshold,
+            use_amp=use_amp,
+            amp_dtype=amp_dtype,
             max_steps=max_steps,
         )
 
-        val_auc = float(val_metrics["auc"])
+        val_auc = float(val_metrics[selection_metric])
         val_accuracy = float(val_metrics["accuracy"])
         auc_improved = math.isfinite(val_auc) and val_auc > best_auc
         accuracy_improved = math.isfinite(val_accuracy) and val_accuracy > best_accuracy
@@ -394,9 +483,20 @@ def run_training_loop(
 
         if accuracy_improved:
             best_accuracy = val_accuracy
-            if auc_improved:
-                best_auc = val_auc
-            epochs_without_accuracy_improvement = 0
+
+        if auc_improved:
+            best_auc = val_auc
+            epochs_without_auc_improvement = 0
+        else:
+            epochs_without_auc_improvement += 1
+
+        lrs_before = current_lrs(optimizer)
+        scheduler_metric = val_auc if math.isfinite(val_auc) else -math.inf
+        scheduler.step(scheduler_metric)
+        lrs_after = current_lrs(optimizer)
+        was_lr_reduced = lr_reduced(lrs_before, lrs_after)
+
+        if auc_improved:
             save_checkpoint(
                 save_path=str(checkpoint_path),
                 epoch=epoch,
@@ -406,34 +506,40 @@ def run_training_loop(
                 best_accuracy=best_accuracy,
                 scheduler=scheduler,
                 config=config,
-                epochs_without_improvement=epochs_without_accuracy_improvement,
+                epochs_without_improvement=epochs_without_auc_improvement,
             )
             checkpoint_saved = True
-        else:
-            epochs_without_accuracy_improvement += 1
 
-        lrs_before = current_lrs(optimizer)
-        scheduler_metric = val_accuracy if math.isfinite(val_accuracy) else -math.inf
-        scheduler.step(scheduler_metric)
-        lrs_after = current_lrs(optimizer)
-        was_lr_reduced = lr_reduced(lrs_before, lrs_after)
+        last_checkpoint_path = checkpoint_path.with_name(f"last_{checkpoint_path.name}")
+        save_checkpoint(
+            save_path=str(last_checkpoint_path),
+            epoch=epoch,
+            model=model,
+            optimizer=optimizer,
+            best_auc=best_auc,
+            best_accuracy=best_accuracy,
+            scheduler=scheduler,
+            config=config,
+            epochs_without_improvement=epochs_without_auc_improvement,
+        )
 
         print(f"Train | {format_metrics(train_metrics)}")
         print(f"Val   | {format_metrics(val_metrics)}")
+        print(f"Validation monitor (val_{selection_metric}): {val_auc:.4f}")
         print(f"Current LR: {', '.join(f'{lr:.8g}' for lr in lrs_after)}")
         print(
-            f"Best validation accuracy: {best_accuracy:.4f}"
-            if math.isfinite(best_accuracy)
-            else "Best validation accuracy: n/a"
+            f"Best validation AUC: {best_auc:.4f}"
+            if math.isfinite(best_auc)
+            else "Best validation AUC: n/a"
         )
-        print(f"Epochs without accuracy improvement: {epochs_without_accuracy_improvement}")
+        print(f"Epochs without AUC improvement: {epochs_without_auc_improvement}")
         print(f"Checkpoint saved: {'yes' if checkpoint_saved else 'no'}")
         print(f"LR reduced: {'yes' if was_lr_reduced else 'no'}")
 
-        if epochs_without_accuracy_improvement >= early_stopping_patience:
+        if epochs_without_auc_improvement >= early_stopping_patience:
             print(
-                f"Early stopping triggered after {epochs_without_accuracy_improvement} epochs "
-                "without validation accuracy improvement."
+                f"Early stopping triggered after {epochs_without_auc_improvement} epochs "
+                "without validation AUC improvement."
             )
             break
 

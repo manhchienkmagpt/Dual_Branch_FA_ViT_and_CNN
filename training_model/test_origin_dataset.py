@@ -4,12 +4,17 @@ from pathlib import Path
 import pandas as pd
 from torch.utils.data import DataLoader
 
-from datasets import DeepfakeFrameDataset, get_eval_transform
+from datasets import DeepfakeFrameDataset, get_eval_transform, get_normalization_stats
 from models import build_model
 from train import load_config, resolve_device
 from utils.checkpoint import load_checkpoint
 from utils.inference import predict, predict_tta
-from utils.metrics import binary_confusion_matrix, compute_binary_metrics, format_metrics
+from utils.metrics import (
+    aggregate_video_predictions,
+    binary_confusion_matrix,
+    compute_binary_metrics,
+    format_metrics,
+)
 
 
 def parse_args():
@@ -27,11 +32,15 @@ def main():
     device = resolve_device(str(config.get("device", "cuda")))
     threshold = float(config.get("threshold", 0.5))
 
+    mean, std = get_normalization_stats(
+        backbone=str(config.get("backbone", "favit_cnn")),
+        vit_backbone_name=str(config.get("vit_backbone_name", "vit_base_patch16_clip_224")),
+    )
     dataset = DeepfakeFrameDataset(
         root_dir=config["data_root"],
         split=config["test_dir"],
         dataset_type="ffpp",
-        eval_transform=get_eval_transform(int(config["image_size"])),
+        eval_transform=get_eval_transform(int(config["image_size"]), mean=mean, std=std),
         original_upsample_factor=0,
         mode="test",
     )
@@ -51,6 +60,12 @@ def main():
         freq_in_channels=int(config.get("freq_in_channels", 3)),
         freq_dim=int(config.get("freq_dim", 128)),
         use_freq=bool(config.get("use_freq", True)),
+        use_cnn_branch=bool(config.get("use_cnn_branch", True)),
+        vit_backbone_name=str(config.get("vit_backbone_name", "vit_base_patch16_clip_224")),
+        use_learnable_fft=bool(config.get("use_learnable_fft", True)),
+        use_bidirectional_fusion=bool(config.get("use_bidirectional_fusion", True)),
+        use_aux_head=bool(config.get("use_aux_head", True)),
+        tune_vit_layernorm=bool(config.get("tune_vit_layernorm", True)),
     ).to(device)
     checkpoint = load_checkpoint(args.checkpoint, device)
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -58,6 +73,7 @@ def main():
     run_predict = predict_tta if args.tta else predict
     image_paths, labels, probs = run_predict(model, loader, device, desc="Test origin dataset")
     metrics = compute_binary_metrics(labels, probs, threshold=threshold)
+    video_metrics, _, _, _ = aggregate_video_predictions(image_paths, labels, probs, threshold=threshold)
     cm = binary_confusion_matrix(labels, probs, threshold=threshold)
     preds = [int(prob >= threshold) for prob in probs]
 
@@ -72,7 +88,8 @@ def main():
         }
     ).to_csv(output_csv, index=False)
 
-    print(f"Origin Dataset Test | {format_metrics(metrics)}")
+    print(f"Origin Dataset Test (Frame) | {format_metrics(metrics)}")
+    print(f"Origin Dataset Test (Video) | {format_metrics(video_metrics)} | videos: {video_metrics.get('num_videos')}")
     print("Confusion Matrix [[TN, FP], [FN, TP]]:")
     print(cm)
     print(f"Saved predictions to: {output_csv}")
