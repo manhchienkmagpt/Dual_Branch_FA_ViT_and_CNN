@@ -122,6 +122,7 @@ def build_model(
     use_bidirectional_fusion: bool = True,
     use_aux_head: bool = True,
     tune_vit_layernorm: bool = True,
+    num_unfrozen_blocks: int = 2,
 ) -> nn.Module:
     backbone_name = normalize_backbone_name(backbone)
     if backbone_name == "efficientnetb4":
@@ -147,6 +148,7 @@ def build_model(
             use_bidirectional_fusion=use_bidirectional_fusion,
             use_aux_head=use_aux_head,
             tune_vit_layernorm=tune_vit_layernorm,
+            num_unfrozen_blocks=num_unfrozen_blocks,
             dropout=dropout,
         )
     return TimmBackbone(

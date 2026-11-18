@@ -52,10 +52,12 @@ class TestUpgradedFAViTPipeline(unittest.TestCase):
         self.assertIsNotNone(model.last_patch_anomaly_map)
         self.assertEqual(model.last_patch_anomaly_map.shape, (2, 14, 14))
 
-        # Verify PEFT: Attention/MLP frozen, LayerNorm & adapters trainable
-        attn_params = [p for n, p in model.vit.named_parameters() if "attn" in n or "mlp" in n]
-        self.assertTrue(len(attn_params) > 0)
-        self.assertTrue(all(not p.requires_grad for p in attn_params))
+        # Verify PEFT: first 10 blocks Attention/MLP frozen, last 2 blocks & adapters trainable
+        early_attn_params = [
+            p for b in model.vit.blocks[:-2] for n, p in b.named_parameters() if "attn" in n or "mlp" in n
+        ]
+        self.assertTrue(len(early_attn_params) > 0)
+        self.assertTrue(all(not p.requires_grad for p in early_attn_params))
         self.assertTrue(any(p.requires_grad for p in model.freq_extractor.parameters()))
         self.assertTrue(any(p.requires_grad for p in model.fusions.parameters()))
 

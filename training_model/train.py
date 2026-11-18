@@ -343,18 +343,6 @@ def run_training_loop(
     selection_metric = str(config.get("selection_metric", "video_auc")).strip().lower()
     if selection_metric not in {"auc", "video_auc"}:
         raise ValueError("selection_metric must be 'auc' or 'video_auc'")
-    config = {**config, "selection_metric": selection_metric}
-    checkpoint_selection_metric = None
-    if active_checkpoint is not None:
-        checkpoint_selection_metric = (active_checkpoint.get("config") or {}).get("selection_metric")
-        if checkpoint_selection_metric is not None:
-            checkpoint_selection_metric = str(checkpoint_selection_metric).strip().lower()
-            if checkpoint_selection_metric != selection_metric:
-                raise ValueError(
-                    f"Cannot resume checkpoint '{resume_path}': selection_metric changed "
-                    f"from '{checkpoint_selection_metric}' to '{selection_metric}'. "
-                    "Keep the checkpoint's selection_metric or start a new run."
-                )
     print(f"Checkpoint selection metric: val_{selection_metric}")
     backbone = str(config.get("backbone", "efficientnetb4"))
     print(f"Backbone: {backbone}")
@@ -372,6 +360,7 @@ def run_training_loop(
         use_bidirectional_fusion=bool(config.get("use_bidirectional_fusion", True)),
         use_aux_head=bool(config.get("use_aux_head", True)),
         tune_vit_layernorm=bool(config.get("tune_vit_layernorm", True)),
+        num_unfrozen_blocks=int(config.get("num_unfrozen_blocks", 2)),
     ).to(device)
 
     if log_parameter_counts:
@@ -421,17 +410,14 @@ def run_training_loop(
         load_model_state_strict(model, checkpoint, str(resume_path))
         if "optimizer_state_dict" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        if checkpoint_selection_metric is not None:
-            if "scheduler_state_dict" in checkpoint:
-                scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-            best_auc = float(checkpoint.get("best_auc", best_auc))
-            epochs_without_auc_improvement = int(checkpoint.get("epochs_without_improvement", 0))
-        else:
-            print(
-                "Checkpoint has no selection_metric metadata; restored model and optimizer, "
-                "but reset best AUC, early-stopping counter, and scheduler history."
-            )
+        if "scheduler_state_dict" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+
+        best_auc = float(checkpoint.get("best_auc", best_auc))
         best_accuracy = float(checkpoint.get("best_accuracy", best_accuracy))
+        epochs_without_auc_improvement = int(
+            checkpoint.get("epochs_without_improvement", 0)
+        )
         checkpoint_epoch = int(checkpoint.get("epoch", 0))
         start_epoch = checkpoint_epoch + 1
         print(f"Resumed from checkpoint: {resume_path} (epoch {checkpoint_epoch})")
@@ -525,7 +511,6 @@ def run_training_loop(
 
         print(f"Train | {format_metrics(train_metrics)}")
         print(f"Val   | {format_metrics(val_metrics)}")
-        print(f"Validation monitor (val_{selection_metric}): {val_auc:.4f}")
         print(f"Current LR: {', '.join(f'{lr:.8g}' for lr in lrs_after)}")
         print(
             f"Best validation AUC: {best_auc:.4f}"

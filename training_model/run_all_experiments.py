@@ -133,7 +133,7 @@ def build_scenarios() -> List[Dict[str, Any]]:
                 "use_bidirectional_fusion": True,
                 "use_aux_head": False,
                 "lambda_fal": 0.0,
-                "lambda_freq_cons": 0.5,
+                "lambda_freq_cons": 0.05,
                 "aux_weight": 0.0,
             },
         },

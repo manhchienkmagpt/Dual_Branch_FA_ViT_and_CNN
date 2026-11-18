@@ -174,7 +174,7 @@ class BidirectionalGatedFusion(nn.Module):
         self.k_f = nn.Linear(dim, dim)
         self.v_f = nn.Linear(dim, dim)
         self.proj_f2s = nn.Linear(dim, dim)
-        self.beta_f2s = nn.Parameter(torch.zeros(1))
+        self.beta_f2s = nn.Parameter(torch.full((1,), 0.1))
 
         # Spatial -> Freq/Local semantic gating
         self.spatial_gate = nn.Sequential(
@@ -183,7 +183,7 @@ class BidirectionalGatedFusion(nn.Module):
             nn.Linear(dim // 4, dim),
             nn.Sigmoid(),
         )
-        self.beta_s2f = nn.Parameter(torch.zeros(1))
+        self.beta_s2f = nn.Parameter(torch.full((1,), 0.1))
 
     def _to_heads(self, tokens: torch.Tensor) -> torch.Tensor:
         batch_size, num_tokens, _ = tokens.shape
@@ -224,6 +224,7 @@ class FAViTCNN(nn.Module):
         use_bidirectional_fusion: bool = True,
         use_aux_head: bool = True,
         tune_vit_layernorm: bool = True,
+        num_unfrozen_blocks: int = 2,
         fusion_block_indices: Iterable[int] = (2, 5, 8, 11),
         dropout: float = 0.3,
     ) -> None:
@@ -242,7 +243,7 @@ class FAViTCNN(nn.Module):
         self.vit_dim = int(self.vit.num_features)
         self.rgb_norm = None if hasattr(self.vit, "norm") else nn.LayerNorm(self.vit_dim)
 
-        # Freeze ViT attention/MLP blocks; optionally tune LayerNorms (PEFT).
+        # Freeze ViT attention/MLP blocks; optionally tune LayerNorms and last N blocks (PEFT).
         for name, param in self.vit.named_parameters():
             if tune_vit_layernorm and ("norm" in name or "ln" in name):
                 param.requires_grad = True
@@ -250,6 +251,10 @@ class FAViTCNN(nn.Module):
                 param.requires_grad = False
 
         num_blocks = len(self.vit.blocks)
+        if num_unfrozen_blocks > 0:
+            for block in self.vit.blocks[max(0, num_blocks - num_unfrozen_blocks):]:
+                for param in block.parameters():
+                    param.requires_grad = True
         self.fusion_block_indices = tuple(idx for idx in fusion_block_indices if 0 <= idx < num_blocks)
         if not self.fusion_block_indices:
             self.fusion_block_indices = (0, min(3, num_blocks - 1), min(6, num_blocks - 1))
@@ -374,7 +379,7 @@ UnifiedFAViT = FAViTCNN
 class FALoss(nn.Module):
     """Hyperspherical Forgery-Aware Loss using L2-normalized features and real prototype."""
 
-    def __init__(self, margin: float = 0.25, scale: float = 32.0, real_compact_weight: float = 0.5) -> None:
+    def __init__(self, margin: float = 0.25, scale: float = 8.0, real_compact_weight: float = 0.1) -> None:
         super().__init__()
         self.margin = margin
         self.scale = scale
@@ -393,8 +398,8 @@ class FALoss(nn.Module):
             return features.new_zeros(())
 
         features_norm = F.normalize(features.float(), dim=1)
-        # Since real=0 and fake=1, classifier_weight[0] points toward fake; -classifier_weight[0] is the real prototype.
-        prototype = -F.normalize(classifier_weight[0].float().view(1, -1), dim=1)
+        # Detach classifier weight so FALoss shapes features around the boundary without spinning Linear.weight.
+        prototype = -F.normalize(classifier_weight[0].detach().float().view(1, -1), dim=1)
         similarities = (features_norm * prototype).sum(dim=1)
 
         sp = similarities[real_mask].mean()
@@ -419,18 +424,17 @@ class SpectralConsistencyLoss(nn.Module):
         logits_clean: torch.Tensor,
         logits_perturbed: torch.Tensor,
     ) -> torch.Tensor:
+        # Stop-gradient on the clean teacher view prevents representation collapse.
         cos_sim = F.cosine_similarity(
-            F.normalize(feat_clean.float(), dim=1),
+            F.normalize(feat_clean.detach().float(), dim=1),
             F.normalize(feat_perturbed.float(), dim=1),
             dim=1,
         )
         feat_loss = (1.0 - cos_sim).mean()
 
-        p_clean = torch.sigmoid(logits_clean.float().view(-1)).clamp(1e-5, 1.0 - 1e-5)
+        p_clean = torch.sigmoid(logits_clean.detach().float().view(-1)).clamp(1e-5, 1.0 - 1e-5)
         p_pert = torch.sigmoid(logits_perturbed.float().view(-1)).clamp(1e-5, 1.0 - 1e-5)
-        kl_1 = p_clean * torch.log(p_clean / p_pert) + (1.0 - p_clean) * torch.log((1.0 - p_clean) / (1.0 - p_pert))
-        kl_2 = p_pert * torch.log(p_pert / p_clean) + (1.0 - p_pert) * torch.log((1.0 - p_pert) / (1.0 - p_clean))
-        kl_loss = 0.5 * (kl_1 + kl_2).mean()
+        kl_loss = (p_clean * torch.log(p_clean / p_pert) + (1.0 - p_clean) * torch.log((1.0 - p_clean) / (1.0 - p_pert))).mean()
         return self.feat_weight * feat_loss + self.kl_weight * kl_loss
 
 

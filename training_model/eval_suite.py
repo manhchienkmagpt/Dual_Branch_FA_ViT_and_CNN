@@ -53,6 +53,7 @@ def build_model_from_config(config: Dict, device: torch.device) -> torch.nn.Modu
         use_bidirectional_fusion=bool(config.get("use_bidirectional_fusion", True)),
         use_aux_head=bool(config.get("use_aux_head", True)),
         tune_vit_layernorm=bool(config.get("tune_vit_layernorm", True)),
+        num_unfrozen_blocks=int(config.get("num_unfrozen_blocks", 2)),
     ).to(device)
 
 
